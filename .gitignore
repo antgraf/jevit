@@ -1,2 +1,4 @@
 *.xpi
 reviewer-key.txt
+
+/artifacts/review-solution/

@@ -1,5 +1,45 @@
 // Shared triage logic for background, popup and options pages (plain script, no bundler).
 const JEV_API = "https://api.typesafe.ai/v1/systemone";
+// Where mail can go: a fixed choice, so the manifest names every host and the consent text names who receives it.
+const OPENROUTER_API = "https://openrouter.ai/api/v1/systemone";
+const LOCAL_PORT = 8791;
+const localApi = (port = LOCAL_PORT) => `http://127.0.0.1:${port}/v1/systemone`; // an Open-Jev server on this computer
+const SERVICES = {
+  typesafe: { name: "TypeSafe", host: "api.typesafe.ai", keys: "typesafe.ai" },
+  openrouter: { name: "OpenRouter", host: "openrouter.ai", keys: "openrouter.ai/keys" },
+  local: { name: "Open-Jev", host: "127.0.0.1" }, // a key is optional
+};
+const serviceOf = (endpoint = JEV_API) =>
+  endpoint === OPENROUTER_API ? "openrouter" : endpoint.startsWith("http://127.0.0.1:") ? "local" : "typesafe";
+
+// Who receives the mail, as the consent text says it. OpenRouter passes it on to the model's provider:
+// TypeSafe for Jev ("jev-latest", "typesafe/jev-1.13"), someone else for a model like "openai/…".
+function receiver(endpoint, model = "") {
+  const service = serviceOf(endpoint);
+  if (service !== "openrouter") return `${SERVICES[service].name} (${SERVICES[service].host})`;
+  const author = model.includes("/") ? model.split("/")[0].replace(/^~/, "") : "typesafe";
+  return author === "typesafe"
+    ? "OpenRouter (openrouter.ai), which passes it to TypeSafe"
+    : `OpenRouter (openrouter.ai) and ${author}, the provider of ${model}`;
+}
+
+// Why triage can't ask Jev yet, or "" when it can.
+function connectionProblem({ endpoint, apiKey, consent }) {
+  const service = serviceOf(endpoint);
+  return !apiKey && service !== "local" ? `no ${SERVICES[service].name} API key is set`
+    : !consent ? `sending mail to ${SERVICES[service].name} is not allowed yet`
+    : "";
+}
+
+// The key field is write-only: a saved key is never loaded back into the page. An empty field keeps the stored key,
+// a typed key replaces it, and only Remove key clears it. `apiKey` is the key of service `from` (the stored one),
+// `apiKeys` every service's. Returns both after the field is saved and the service goes from `from` to `to`.
+function storeKey({ apiKey = "", apiKeys = {} }, from, to, typed, remove = false) {
+  const keys = { ...apiKeys, [from]: remove ? "" : typed.trim() || apiKey };
+  return { apiKey: keys[to] ?? "", apiKeys: keys };
+}
+// That a key is saved, without showing it: its last 4 characters, or none of a short key.
+const keySaved = (key) => (key.length < 8 ? "Key saved" : `Key saved, ending in …${key.slice(-4)}`);
 const HEADER_CHARS = 1000; // per header (and per address, subject, sender), so a sender can't inflate the request
 const MAX_RECIPIENTS = 20; // To and Cc each; enough to tell a personal mail from a mass mailing
 const MAX_EXAMPLES = 20; // per recipe, newest kept; examples ride along in every request (~100 tokens each)
@@ -136,7 +176,7 @@ const DEFAULTS = {
   apiKey: "",
   consent: false, // explicit opt-in before any mail content leaves Thunderbird (ATN policy)
   model: "jev-latest",
-  endpoint: JEV_API, // or a local Open-Jev server, e.g. http://127.0.0.1:8791/v1/systemone
+  endpoint: JEV_API, // OPENROUTER_API, or localApi(port). Other services' keys are kept in `apiKeys`, outside the settings
   autoTriage: false,
   skipTriaged: true, // triaging selected mail skips mail Jev already judged: Triaged tag or stored scores
   triagedTag: true, // tag every judged mail Triaged. Thunderbird fills a selected row with its first tag's colour, so off keeps untouched mail looking as before
@@ -154,18 +194,35 @@ const DEFAULTS = {
   recipes: RECIPE_LIBRARY.slice(0, 5),
 };
 
+// Links written out in text, down to where they go: a web link keeps only its host (no user:password@, port, path,
+// query or #fragment), a mailto: link only its address. Punctuation ending the sentence stays.
+// A link the URL parser rejects still loses everything around its host-like part, never kept as written.
+function linksToHosts(text) {
+  return text.replace(/(?:https?:\/\/|mailto:)[^\s>)\]]+/gi, (link) => {
+    // A loop, not a regex: splitting the trailing punctuation off with one backtracks quadratically on a long run of it.
+    let end = link.length;
+    while (`.,;:!?'"`.includes(link[end - 1])) end--;
+    const url = link.slice(0, end), tail = link.slice(end);
+    if (/^mailto:/i.test(url)) return url.slice(7).split(/[?#]/)[0] + tail;
+    try { return new URL(url).hostname + tail; } catch {}
+    const authority = url.replace(/^[a-z]+:\/\//i, "").split(/[/\\?#]/)[0];
+    return authority.slice(authority.lastIndexOf("@") + 1).split(":")[0] + tail;
+  });
+}
+
 // ponytail: hard cut at `max` characters; add smarter excerpting if long mails misclassify
 function cleanBody(text, max = DEFAULTS.bodyChars) {
-  return text
-    .replace(/[\u00AD\u034F\u200B-\u200D\u2060\uFEFF]/g, "") // invisible preheader padding in marketing mail
-    .replace(/https?:\/\/([^/\s>)\]]+)[^\s>)\]]*/g, "$1") // links: keep the host, drop paths and tracking tokens
+  const visible = text.replace(/[\u00AD\u034F\u200B-\u200D\u2060\uFEFF]/g, ""); // invisible preheader padding in marketing mail
+  const kept = visible
     .split("\n")
     .map((l) => l.replace(/[ \t ]+/g, " ").trim())
     .filter((l) => !l.startsWith(">")) // quoted replies are noise for the current mail
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
-    .trim()
-    .slice(0, max);
+    .trim();
+  // A mail can be megabytes: links are cut down only in what can still end up within `max`, ten times as much to leave
+  // room for the characters long tracking links give back.
+  return linksToHosts(kept.slice(0, 10 * max)).slice(0, max);
 }
 
 function questionFor(r) {
@@ -188,8 +245,8 @@ function questionsFor(recipes) {
 // changing a threshold. A score belongs to the exact email Jev saw and the exact question (model, recipe question,
 // criteria and examples): editing or teaching a recipe makes its old scores stale. Keyed by a hash of the email,
 // not its Message-ID: the sender picks that, and could borrow the scores of mail you trust.
-// Another endpoint (a local Open-Jev server) keeps its own scores; TypeSafe's keep their original keys.
-// Kept for SCORE_DAYS after Jev was last asked about the email (reuse doesn't extend it); pruneScores() runs at startup.
+// Another endpoint (OpenRouter, a local Open-Jev server) keeps its own scores; TypeSafe's keep their original keys.
+// Kept for SCORE_DAYS after Jev was last asked about the email (reuse doesn't extend it); pruneScores() runs daily.
 const SCORE_DAYS = 90;
 const digest = async (value) => {
   const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
@@ -205,9 +262,16 @@ function reuse(recipes, sigs, stored = {}) {
   return { answers, missing };
 }
 
+// Jev's yes-probability in an answer, or undefined when it isn't a number from 0 to 1: Jev's answer is checked, not trusted.
+const noulOf = (answer) => (typeof answer?.noul === "number" && answer.noul >= 0 && answer.noul <= 1 ? answer.noul : undefined);
+
+// The answers in Jev's response that hold a score, for the recipes it was asked about. Anything else is left out.
+const scoresIn = (recipes, answers) =>
+  Object.fromEntries(recipes.flatMap((r) => (noulOf(answers?.[r.key]) === undefined ? [] : [[r.key, answers[r.key]]])));
+
 // The scores to store for an email: one per current recipe, so stale ones are dropped.
 const remember = (recipes, sigs, answers) =>
-  Object.fromEntries(recipes.flatMap((r, i) => (typeof answers[r.key]?.noul === "number" ? [[sigs[i], answers[r.key].noul]] : [])));
+  Object.fromEntries(recipes.flatMap((r, i) => (noulOf(answers[r.key]) === undefined ? [] : [[sigs[i], noulOf(answers[r.key])]])));
 
 // Remove stored scores older than SCORE_DAYS. Entries without a time count as old; pruneScores(Infinity) removes all.
 async function pruneScores(now = Date.now()) {
@@ -219,14 +283,14 @@ async function pruneScores(now = Date.now()) {
 // Recipe keys whose yes-probability clears that recipe's threshold. A recipe set to skip known senders
 // never matches mail from someone you know, whatever Jev says.
 function decide(recipes, answers, known = false) {
-  return recipes.filter((r) => answers[r.key]?.noul >= r.threshold && !(known && r.skipKnown)).map((r) => r.key);
+  return recipes.filter((r) => noulOf(answers[r.key]) >= r.threshold && !(known && r.skipKnown)).map((r) => r.key);
 }
 
 // How sure Jev was about the matches. A match under `actSure` only tags: a wrong tag is easy to spot, a wrong move
 // to Junk hides the mail. `unsure`: a match held back like that, or a recipe that scored just under its threshold.
 // Those mails are the ones worth teaching Jev from.
 function certainty(recipes, answers, keys, { actSure = 0, unsureMargin = 0 } = {}) {
-  const p = (r) => answers[r.key]?.noul ?? 0;
+  const p = (r) => noulOf(answers[r.key]) ?? 0;
   const act = recipes.filter((r) => keys.includes(r.key) && (r.action === "tag" || p(r) >= actSure)).map((r) => r.key);
   const unsure = unsureMargin > 0 && recipes.some((r) =>
     keys.includes(r.key) ? !act.includes(r.key) : p(r) < r.threshold && p(r) >= r.threshold - unsureMargin);
@@ -265,16 +329,27 @@ function plan(recipes, keys, answers) {
   const has = (...actions) => hit.some((r) => actions.includes(r.action));
   const move = hit
     .filter((r) => movesMail(r.action) && r.folder)
-    .sort((a, b) => (answers[b.key]?.noul ?? 0) - (answers[a.key]?.noul ?? 0))[0];
+    .sort((a, b) => (noulOf(answers[b.key]) ?? 0) - (noulOf(answers[a.key]) ?? 0))[0];
   return {
     update: { ...(has("read") && { read: true }), ...(has("flag") && { flagged: true }), ...(has("junk", "junkmove") && { junk: true }) },
     folder: move?.folder ?? null,
   };
 }
 
+// An example is a mail's sender, subject and start of its text, with your yes or no. The same mail taught again
+// replaces its example: a second click doesn't count it twice, and a corrected answer doesn't contradict the old one.
+const exampleOf = (email, label) => ({ from: email.from, subject: email.subject, snippet: email.body.slice(0, 300), label });
+const sameMail = (a, b) => a.from === b.from && a.subject === b.subject && a.snippet === b.snippet;
+const withExample = (examples, example) => [...examples.filter((e) => !sameMail(e, example)), example].slice(-MAX_EXAMPLES);
 function addExample(recipe, email, label) {
-  const example = { from: email.from, subject: email.subject, snippet: email.body.slice(0, 300), label };
-  recipe.examples = [...recipe.examples, example].slice(-MAX_EXAMPLES);
+  recipe.examples = withExample(recipe.examples, exampleOf(email, label));
+}
+
+// A recipe's examples in the manager, with the stored ones it hasn't seen yet (`seen`: what it last read from storage)
+// added: taught from the menu or the popup while it was open. Examples it took out (✕, Forget examples) stay out.
+function mergeExamples(mine, stored = [], seen = []) {
+  const has = (list, e) => list.some((x) => sameMail(x, e) && x.label === e.label);
+  return stored.filter((e) => !has(seen, e) && !has(mine, e)).reduce(withExample, mine);
 }
 
 // "Free Mobile <x@free.fr>" -> "Free Mobile"; "x@free.fr" -> "free.fr".
@@ -331,33 +406,86 @@ function parseBackup(text) {
 let queue = Promise.resolve();
 const serial = (fn) => (queue = queue.then(fn, fn));
 
-async function askJev({ apiKey, model, endpoint }, state, questions) {
+// Unticking consent, or another service or model, also aborts the requests already on their way, not only the next
+// ones: storage.onChanged reaches every JevIt page, so this covers the popup as well as a running triage.
+let halt = new AbortController();
+function haltRequests(changes) {
+  const changed = (key) => key in changes && changes[key].newValue !== changes[key].oldValue;
+  const why = changed("consent") && !changes.consent.newValue ? "Sending mail was stopped: consent was unticked in the JevIt manager."
+    : changed("endpoint") || changed("model") ? "The service or model changed in the JevIt manager. Triage again to use it."
+    : "";
+  if (!why) return;
+  halt.abort(new Error(why, { cause: "halt" }));
+  halt = new AbortController();
+}
+globalThis.messenger?.storage?.onChanged.addListener(haltRequests);
+
+const REQUEST_SECONDS = 60; // per attempt: a request that hangs fails its mail instead of holding up the batch
+
+// A wait that ends early, with the signal's reason, when it aborts.
+const wait = (ms, signal) => new Promise((resolve, reject) => {
+  if (signal?.aborted) return reject(signal.reason);
+  const abort = () => (clearTimeout(timer), reject(signal.reason));
+  const timer = setTimeout(() => (signal?.removeEventListener("abort", abort), resolve()), ms);
+  signal?.addEventListener("abort", abort, { once: true });
+});
+
+// `signal` aborts the request and its waits between retries (triage's Stop, consent unticked).
+// An error with `maybePaid` cut off a request Jev already had (stopped, timed out): it may be charged.
+// What a failed request's reply says, kept short for notifications and the error log: the message of a JSON error
+// ({ error: { message } }, { error }, { message } or { detail }), or else the reply's text without HTML tags.
+// A proxy's or captive portal's whole web page shouldn't end up there.
+function replyReason(text = "") {
+  let json;
+  try { json = JSON.parse(text); } catch {}
+  const said = [json?.error?.message, json?.error, json?.message, json?.detail].find((s) => typeof s === "string");
+  return (said ?? text.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim().slice(0, 200);
+}
+
+async function askJev({ apiKey, model, endpoint }, state, questions, signal) {
   for (let attempt = 0; ; attempt++) {
+    signal?.throwIfAborted();
+    const timeout = AbortSignal.timeout(REQUEST_SECONDS * 1000);
+    const cut = (maybePaid) => (e) => {
+      if (!signal?.aborted && !timeout.aborted) throw e;
+      const why = signal?.aborted ? signal.reason : { message: `Jev didn't answer within ${REQUEST_SECONDS} seconds` };
+      throw Object.assign(new Error(why.message, { cause: why.cause }), { maybePaid }); // a copy: parallel mails share the reason
+    };
     const r = await fetch(endpoint || JEV_API, {
       method: "POST",
       redirect: "error", // mail and key go to this endpoint only, never on to where it redirects
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, state, questions }),
-    });
+      headers: { ...(apiKey && { Authorization: `Bearer ${apiKey}` }), "Content-Type": "application/json" },
+      // A cut can split an emoji, and Jev rejects the lone half ("invalid Unicode text"): it goes as U+FFFD instead.
+      body: JSON.stringify({ model, state, questions }, (k, v) => (typeof v === "string" ? v.toWellFormed() : v)),
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    }).catch(cut(true));
     if ((r.status === 429 || r.status === 529) && attempt < 4) {
-      await new Promise((res) => setTimeout(res, 1000 * 2 ** attempt));
+      await wait(1000 * 2 ** attempt, signal);
       continue;
     }
-    if (!r.ok) throw new Error(`Jev ${r.status}: ${await r.text()}`);
-    return r.json(); // { model, answers, usage: { input_tokens, output_tokens } }
+    if (!r.ok) {
+      const reason = replyReason(await r.text().catch(cut(false)));
+      throw new Error(`Jev ${r.status}${reason ? `: ${reason}` : ""}`);
+    }
+    return r.json().catch(cut(true)); // { model, answers, usage: { input_tokens, output_tokens } }
   }
 }
 
 // --- Usage and budget (estimated from the token counts Jev returns) ---
 
 const monthOf = (date = new Date()) => date.toISOString().slice(0, 7); // "2026-09"
+// "September 2026" for "2026-09": the budget's month is UTC, so its name is too, also late on the last day of a month.
+const monthName = (month = monthOf(), locale = undefined) =>
+  new Date(`${month}-01T00:00:00Z`).toLocaleString(locale, { month: "long", year: "numeric", timeZone: "UTC" });
 const money = (usd) => `$${usd > 0 && usd < 0.01 ? usd.toFixed(5) : usd.toFixed(2)}`;
 const emptyUsage = () => ({ requests: 0, inputTokens: 0, cost: 0 });
 
 // Counters after one more request: this month's (restarting when the month changes) and all-time.
-function addUsage(usage, month, inputTokens, pricePerMtok) {
-  const cost = (inputTokens * pricePerMtok) / 1e6;
-  const add = (u) => ({ requests: u.requests + 1, inputTokens: u.inputTokens + inputTokens, cost: u.cost + cost });
+// OpenRouter reports what a request cost; otherwise it's estimated from the input tokens.
+// `requests` 0 corrects a request counted before its answer, -1 takes it back; counters don't go below 0.
+function addUsage(usage, month, inputTokens, pricePerMtok, reported, requests = 1) {
+  const cost = typeof reported === "number" ? reported : (inputTokens * pricePerMtok) / 1e6;
+  const add = (u) => ({ requests: Math.max(0, u.requests + requests), inputTokens: Math.max(0, u.inputTokens + inputTokens), cost: Math.max(0, u.cost + cost) });
   const current = usage?.month === month ? usage : emptyUsage();
   return { month, ...add(current), total: add(usage?.total ?? emptyUsage()) };
 }
@@ -372,10 +500,64 @@ function budgetLeft(settings, usage, month) {
 
 const loadUsage = async () => (await messenger.storage.local.get({ usage: null })).usage;
 
+// Runs fn on the background page, one at a time with its other serial() calls. Each page has its own serial() queue,
+// so a popup or the manager changing storage at the same moment as a triage or teach could lose one change: other
+// pages send `message` there instead, and the background page answers it by making the same call (background.js).
+function inBackground(message, fn) {
+  const background = globalThis.messenger?.extension?.getBackgroundPage?.();
+  if (background && background !== globalThis) return messenger.runtime.sendMessage(message);
+  return serial(fn);
+}
+
+// Counts a change to the usage (addUsage's arguments). With `budget`, only while this month's budget isn't used up:
+// returns whether it was counted, so checking and counting are one step and parallel mails can't all slip past.
+// The background page does every count (inBackground).
+function countUsage(change, budget) {
+  return inBackground({ countUsage: [change, budget] }, async () => {
+    const usage = await loadUsage(), month = monthOf(), { inputTokens, pricePerMtok, reported, requests } = change;
+    if (budget !== undefined && budgetLeft({ budget }, usage, month) <= 0) return false;
+    await messenger.storage.local.set({ usage: addUsage(usage, month, inputTokens, pricePerMtok, reported, requests) });
+    return true;
+  });
+}
+
 const loadSettings = () => messenger.storage.local.get(DEFAULTS);
+
+// Recipes are written on the background page only, one write at a time, each on the recipes read fresh from storage
+// (inBackground). Otherwise a teach, an Apply and a Save would each write the whole list they started from, and the
+// last one would drop the others' changes.
+
+// Stores examples ({ key, example }) taught from the menu, a shortcut or the popup into the recipes they're for.
+// A recipe removed meanwhile gets none. Returns how many were stored.
+function learn(taught) {
+  return inBackground({ learn: [taught] }, async () => {
+    const { recipes } = await messenger.storage.local.get({ recipes: DEFAULTS.recipes });
+    let stored = 0;
+    const changed = recipes.map((r) => {
+      const added = taught.filter((t) => t.key === r.key).map((t) => t.example);
+      stored += added.length;
+      return added.length ? { ...r, examples: added.reduce(withExample, r.examples) } : r;
+    });
+    if (stored) await messenger.storage.local.set({ recipes: changed });
+    return stored;
+  });
+}
+
+// Save in the manager: its settings, keeping the examples stored since it last read them (mergeExamples; `seen` holds
+// what it read, by recipe key). Returns the recipes as saved.
+function saveSettings(settings, seen) {
+  return inBackground({ saveSettings: [settings, seen] }, async () => {
+    const { recipes: stored = [] } = await messenger.storage.local.get("recipes");
+    const recipes = settings.recipes.map((r) =>
+      ({ ...r, examples: mergeExamples(r.examples, stored.find((x) => x.key === r.key)?.examples, seen[r.key]) }));
+    await messenger.storage.local.set({ ...settings, recipes });
+    return recipes;
+  });
+}
 
 // "Log in to PayPal → evil.example": what a link says, next to the host it really goes to. One entry per host, in order.
 // Links without a host (relative, mailto:, javascript:) are left out. Hosts come out in punycode, so look-alikes show.
+// A link text that is itself a URL ("https://paypal.com/reset?token=…") is cut down to its host like the body.
 function linkHosts(anchors) {
   const seen = new Set();
   return anchors.flatMap(({ href, text }) => {
@@ -383,13 +565,30 @@ function linkHosts(anchors) {
     try { host = new URL(href).hostname; } catch {}
     if (!host || seen.has(host)) return [];
     seen.add(host);
-    return [`${text.replace(/\s+/g, " ").trim().slice(0, 80)} → ${host}`.trim()];
+    return [`${linksToHosts(text.slice(0, HEADER_CHARS).replace(/\s+/g, " ").trim()).slice(0, 80)} → ${host}`.trim()];
   }).slice(0, MAX_LINKS);
 }
 
-// Visible text of an HTML body: without CSS and scripts, which textContent would otherwise keep.
+// Whether an inline style hides its element: display:none, visibility:hidden, opacity or font-size 0, or a height
+// of 0 with overflow hidden. "!important", spacing and case don't matter.
+function hiddenStyle(style = "") {
+  const css = Object.fromEntries(style.split(";").map((d) => d.split(":").map((s) => s.replace(/!\s*important/i, "").trim().toLowerCase())));
+  const zero = (v) => parseFloat(v) === 0;
+  return css.display === "none" || css.visibility === "hidden" || zero(css.opacity) || zero(css["font-size"]) ||
+    ((zero(css.height) || zero(css["max-height"])) && css.overflow === "hidden");
+}
+
+// Removes what the reader doesn't see, with everything inside it, so its text and links aren't sent and can't sway the
+// score. A guess from inline styles and the hidden attribute only: DOMParser lays nothing out, and <style> rules aren't read.
+function stripHidden(doc) {
+  doc.querySelectorAll("[hidden], [style]").forEach((e) => (e.hasAttribute("hidden") || hiddenStyle(e.getAttribute("style"))) && e.remove());
+}
+
+// Text of an HTML body: without CSS and scripts, which textContent would otherwise keep, and with a line break after
+// each block, which textContent would otherwise run together ("Track itKind regards").
 function htmlText(doc) {
   doc.querySelectorAll("style, script, noscript, template").forEach((e) => e.remove());
+  doc.querySelectorAll("br, p, div, li, tr, td, th, h1, h2, h3, h4, h5, h6, blockquote, table").forEach((e) => e.after("\n"));
   return doc.body.textContent;
 }
 
@@ -403,10 +602,13 @@ async function emailState(id, bodyChars) {
   const parts = await messenger.messages.listInlineTextParts(id);
   const plain = parts.find((p) => p.contentType === "text/plain");
   const html = parts.find((p) => p.contentType === "text/html");
-  // Links come from the HTML part even when the plain part is the body: that's where the sender can hide where they go.
+  // Body and links come from the HTML part when there is one: Thunderbird shows that part, and the sender can make the
+  // plain part say something else entirely.
+  // Hidden elements go first, so hidden links can't push the real ones out of the MAX_LINKS.
   const doc = html && new DOMParser().parseFromString(html.content, "text/html");
+  if (doc) stripHidden(doc);
   const links = doc ? linkHosts([...doc.querySelectorAll("a[href]")].map((a) => ({ href: a.getAttribute("href"), text: a.textContent }))) : [];
-  const body = plain ? plain.content : doc ? htmlText(doc) : "";
+  const body = doc ? htmlText(doc) : plain?.content ?? "";
   const full = await messenger.messages.getFull(id);
   // Thunderbird can fail to list a bounce's attachments (message/delivery-status); the MIME tree still has them.
   const listed = await messenger.messages.listAttachments(id).catch((e) => {
@@ -421,38 +623,83 @@ async function emailState(id, bodyChars) {
   // Everything the sender writes is capped: this ends up in every request, and in examples that ride along in later ones.
   const cut = (text = "") => text.slice(0, HEADER_CHARS);
   const cutList = (list = []) => list.slice(0, MAX_RECIPIENTS).map(cut);
+  // List-Unsubscribe links carry a personal token; that there is one, and its host, is the signal.
+  const unsubscribe = header("list-unsubscribe");
   return {
     me: identity?.email ?? "",
     email: {
       from: cut(m.author), to: cutList(m.recipients), cc: cutList(m.ccList), subject: cut(m.subject), body: cleanBody(body, bodyChars),
       links, attachments,
-      headers: { "Authentication-Results": header("authentication-results"), "List-Unsubscribe": header("list-unsubscribe"), "Reply-To": header("reply-to") },
+      headers: { "Authentication-Results": header("authentication-results"), "List-Unsubscribe": unsubscribe && linksToHosts(unsubscribe), "Reply-To": header("reply-to") },
     },
   };
 }
 
 // Has Jev judged this exact email before (stored scores, kept SCORE_DAYS)? Works without the Triaged tag.
+// Not when no score was kept, or when the triage they came from didn't finish (`retry`): triaging it again redoes it.
 async function judgedBefore(id, bodyChars, endpoint) {
   const key = await scoreKey(await emailState(id, bodyChars), endpoint);
-  return !!(await messenger.storage.local.get(key))[key];
+  const stored = (await messenger.storage.local.get(key))[key];
+  return !!stored && !stored.retry && Object.entries(stored).some(([sig, noul]) => sig !== "at" && typeof noul === "number");
 }
 
-async function classify(id, settings) {
-  // Consent and budget are read fresh, so changing them in the manager takes effect mid-batch.
-  // Their errors have cause "halt": the rest of a batch would fail the same way.
-  const { consent, budget } = await messenger.storage.local.get({ consent: DEFAULTS.consent, budget: DEFAULTS.budget });
-  if (!consent) throw new Error("Allow sending mail to TypeSafe first (JevIt manager, top of the page).", { cause: "halt" });
-  const state = await emailState(id, settings.bodyChars);
+// Marks an email's stored scores (`key` from classify) as from a triage that didn't finish, or as finished again.
+// Marked scores are still reused for free; they only stop "Skip already triaged mail" from skipping the email.
+async function markRetry(key, retry) {
+  const { [key]: stored } = await messenger.storage.local.get(key);
+  if (!stored || !!stored.retry === retry) return;
+  const { retry: _, ...scores } = stored;
+  await messenger.storage.local.set({ [key]: retry ? { ...scores, retry } : scores });
+}
+
+// Consent, budget and connection are read fresh, so changing them in the manager takes effect mid-batch; `signal` is
+// checked with them. Their errors have cause "halt": the rest of a batch would fail the same way. Returns what was read.
+async function allowed(settings, signal) {
+  signal?.throwIfAborted();
+  const now = await messenger.storage.local.get({ consent: DEFAULTS.consent, budget: DEFAULTS.budget, endpoint: DEFAULTS.endpoint, model: DEFAULTS.model });
+  signal?.throwIfAborted();
+  if (!now.consent) throw new Error(`Allow sending mail to ${SERVICES[serviceOf(now.endpoint)].name} first (JevIt manager, top of the page).`, { cause: "halt" });
+  // Consent given for another service or model doesn't cover the one this batch started with.
+  if (now.endpoint !== settings.endpoint || now.model !== settings.model) {
+    throw new Error("The service or model changed in the JevIt manager. Triage again to use it.", { cause: "halt" });
+  }
+  return now;
+}
+
+// One request to Jev, counted before it's sent: a guess at its tokens counts while there's budget left, and is corrected
+// to what Jev reports. So parallel mails can't all start on the last cents of a budget; at most one request goes past it.
+// A request that didn't reach Jev, or that Jev refused, is taken back. One cut off on its way may be charged: it stays.
+async function askCounted(settings, budget, state, questions, signal) {
+  const tokens = Math.ceil(JSON.stringify({ state, questions }).length / 4), { pricePerMtok } = settings; // ~4 characters a token
+  if (!(await countUsage({ inputTokens: tokens, pricePerMtok }, budget))) {
+    throw new Error(`Monthly Jev budget of ${money(budget)} reached. Raise it in the JevIt manager, or wait for next month.`, { cause: "halt" });
+  }
+  let response;
+  try {
+    await allowed(settings, signal); // once more, right before the mail leaves
+    response = await askJev(settings, state, questions, signal);
+  } catch (e) {
+    if (!e.maybePaid) await countUsage({ inputTokens: -tokens, pricePerMtok, requests: -1 });
+    throw e;
+  }
+  const { input_tokens = 0, cost } = response?.usage ?? {};
+  const reported = typeof cost === "number" ? cost - (tokens * pricePerMtok) / 1e6 : undefined;
+  await countUsage({ inputTokens: input_tokens - tokens, pricePerMtok, reported, requests: 0 });
+  return response;
+}
+
+// `stopped` is the caller's signal: triage's Stop. It and haltRequests abort a request on its way, and an answer that
+// comes back after either is dropped: no stored scores, and nothing for the caller to tag.
+async function classify(id, settings, stopped) {
+  const signal = stopped ? AbortSignal.any([halt.signal, stopped]) : halt.signal;
+  const { budget } = await allowed(settings, signal);
+  const state = await emailState(id, settings.bodyChars).catch(during("Reading the mail"));
   const key = await scoreKey(state, settings.endpoint);
   const [sigs, stored] = await Promise.all([questionSigs(settings.recipes, settings.model), messenger.storage.local.get(key).then((o) => o[key])]);
   const { answers: kept, missing } = reuse(settings.recipes, sigs, stored);
   // Only a request costs money: stored scores are reused even when the budget is used up.
-  const month = monthOf();
-  if (missing.length && budgetLeft({ budget }, await loadUsage(), month) <= 0) {
-    throw new Error(`Monthly Jev budget of ${money(budget)} reached. Raise it in the JevIt manager, or wait for next month.`, { cause: "halt" });
-  }
   const [response, known] = await Promise.all([
-    missing.length ? askJev(settings, state, questionsFor(missing)) : null,
+    missing.length ? askCounted(settings, budget, state, questionsFor(missing), signal) : null,
     // A failing lookup must not fail the triage: the Jev request is already paid for. Treat as unknown.
     // Without a DMARC pass from your own mail server the From address may be faked, so the sender doesn't count as known.
     settings.recipes.some((r) => r.skipKnown) && dmarcPass(state.email.headers["Authentication-Results"], state.email.from)
@@ -461,16 +708,18 @@ async function classify(id, settings) {
         .catch((e) => (console.warn("JevIt: known-sender check failed", e), false))
       : false,
   ]);
-  const answers = { ...kept, ...response?.answers };
-  if (response) {
-    // ponytail: serial() only covers this page; a popup and a background batch finishing at the same moment can drop one count
-    await serial(async () => messenger.storage.local.set({ usage: addUsage(await loadUsage(), month, response.usage?.input_tokens ?? 0, settings.pricePerMtok) }));
-    await messenger.storage.local.set({ [key]: { ...remember(settings.recipes, sigs, answers), at: Date.now() } });
-  }
+  await allowed(settings, signal);
+  // Only answers with a numeric score count. A response without any fails the mail and stores nothing, so triaging it
+  // again asks again (the request stays counted); a partial one keeps the scores it has.
+  const fresh = scoresIn(missing, response?.answers);
+  if (missing.length && !Object.keys(fresh).length) throw new Error("Reading Jev's answer: it has no scores");
+  const answers = { ...kept, ...fresh };
+  // A `retry` mark (markRetry) stays until a triage finishes: the popup asks Jev too, but doesn't move the mail.
+  if (response) await messenger.storage.local.set({ [key]: { ...remember(settings.recipes, sigs, answers), at: Date.now(), ...(stored?.retry && { retry: true }) } });
   const keys = decide(settings.recipes, answers, known);
   // A recipe that can't match this sender can't be unsure about it either.
   const open = settings.recipes.filter((r) => !(known && r.skipKnown));
-  return { state, answers, known, keys, paid: !!response, ...certainty(open, answers, keys, settings) };
+  return { state, key, retry: !!stored?.retry, answers, known, keys, paid: !!response, ...certainty(open, answers, keys, settings) };
 }
 
 // Was this mail's topmost Authentication-Results header written by the account's own mail server? A server that
@@ -489,10 +738,17 @@ async function trustedServer(accountId) {
   const cached = authServers[accountId];
   if (cached && Date.now() - cached.at < 7 * 864e5) return cached.id;
   const inbox = (await messenger.folders.query({ accountId, specialUse: ["inbox"] })).map((f) => f.id);
-  const found = inbox.length ? await messenger.messages.query({ folderId: inbox, fromDate: new Date(Date.now() - 90 * 864e5), messagesPerPage: AUTH_SAMPLE }) : [];
+  // A query can't sort and returns the oldest matches first: the last 2 weeks, or 90 days in a quiet Inbox, keeps the
+  // sample recent, so a server that changed its name is picked up within a few weeks.
+  const since = async (days) => {
+    const found = await messenger.messages.query({ folderId: inbox, fromDate: new Date(Date.now() - days * 864e5), messagesPerPage: AUTH_SAMPLE });
+    return (found.messages ?? found).slice(0, AUTH_SAMPLE);
+  };
+  let sample = inbox.length ? await since(14) : [];
+  if (inbox.length && sample.length < AUTH_SAMPLE) sample = await since(90);
   const counts = new Map();
   let sampled = 0;
-  for (const m of (found.messages ?? found).slice(0, AUTH_SAMPLE)) {
+  for (const m of sample) {
     const header = (await messenger.messages.getFull(m.id)).headers["authentication-results"]?.[0];
     const key = header === undefined ? null : authServId(header);
     counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -500,7 +756,10 @@ async function trustedServer(accountId) {
   }
   const [best, n = 0] = [...counts].sort((a, b) => b[1] - a[1])[0] ?? [];
   const id = best != null && n >= 3 && n > sampled / 2 ? best : null;
-  await messenger.storage.local.set({ authServers: { ...authServers, [accountId]: { id, at: Date.now() } } });
+  await serial(async () => { // parallel triage can look up two accounts at once: keep both
+    const { authServers: stored = {} } = await messenger.storage.local.get("authServers");
+    await messenger.storage.local.set({ authServers: { ...stored, [accountId]: { id, at: Date.now() } } });
+  });
   return id;
 }
 
@@ -522,18 +781,49 @@ async function knownSender(author) {
 }
 
 // Set this extension's tags (leaving the user's other tags alone), then run the actions of the recipes in `act`.
-// `triaged`: Jev judged this mail, so it also gets the Triaged tag (kept on later re-triage or teaching).
+// `triaged`: Jev judged this mail, so it also gets the Triaged tag (kept on later re-triage or teaching). A failed
+// move takes it off again: the triage didn't finish. The folder is found first, so a folder that can't be made
+// fails the mail before anything changes.
 // `unsure` adds the Unsure tag; any other call removes it, because the user has now judged the mail.
 // Tags must exist first: call syncTags(settings) before a batch.
 async function applyRecipes(id, recipes, keys, answers, triaged = false, { act = keys, unsure = false } = {}) {
   const extra = [...(triaged ? [TRIAGED] : []), ...(unsure ? [UNSURE] : [])];
   const ours = new Set([...recipes.map((r) => r.key), UNSURE.key]);
-  const m = await messenger.messages.get(id);
+  const m = await messenger.messages.get(id).catch(during("Reading the mail"));
   const { update, folder } = plan(recipes, act, answers);
+  const target = folder && m.folder ? await resolveFolder(folder, m.folder.accountId).catch(during("Finding the folder")) : folder;
   const tags = new Set([...m.tags.filter((t) => !ours.has(t)), ...keys, ...extra.map((t) => t.key)]);
-  await messenger.messages.update(id, { ...update, tags: [...tags] });
-  const target = folder && m.folder ? await resolveFolder(folder, m.folder.accountId) : folder;
-  if (target && target !== m.folder?.id) await messenger.messages.move([id], target);
+  await messenger.messages.update(id, { ...update, tags: [...tags] }).catch(during("Tagging the mail"));
+  if (!target || target === m.folder?.id) return;
+  await messenger.messages.move([id], target).catch(async (e) => {
+    if (triaged) {
+      tags.delete(TRIAGED.key);
+      await messenger.messages.update(id, { tags: [...tags] }).catch((err) => console.warn("JevIt: removing the Triaged tag failed", err));
+    }
+    during("Moving the mail")(e);
+  });
+}
+
+// The step that failed, in front of the error. Halts keep their own message and cause.
+const during = (step) => (e) => {
+  throw e?.cause === "halt" ? e : new Error(`${step}: ${e?.message ?? e}`, { cause: e?.cause });
+};
+
+// Runs fn(id) for a mail from a list. Thunderbird can drop a mail's id while Jev answers (an add-on restart, or the
+// header replaced); then the mail is found again by its Message-ID and fn runs once more. Only in the same folder:
+// mail moved meanwhile (to Junk by Thunderbird's junk filter, to Trash) is left alone, so a move recipe can't pull
+// it back out. That error has cause "gone": nothing went wrong, so triage counts it instead of logging it.
+async function onMessage(m, fn) {
+  try {
+    return await fn(m.id);
+  } catch (e) {
+    if (!/Message not found/.test(e?.message) || !m.headerMessageId) throw e;
+    const { messages } = await messenger.messages.query({ headerMessageId: m.headerMessageId, folderId: m.folder?.id });
+    const again = messages.find((x) => x.folder?.id === m.folder?.id);
+    if (!again) throw new Error(`${e.message} It was moved or deleted while JevIt worked on it.`, { cause: "gone" });
+    m.id = again.id; // the next step uses the new id too
+    return fn(m.id);
+  }
 }
 
 // "light" or "dark": the chosen colour set, or Thunderbird's current theme when set to follow it.
@@ -549,7 +839,15 @@ const colorFor = (r, scheme) => (scheme === "light" ? r.colorLight ?? defaultCol
 // the recipes and settings, so a rename in Thunderbird's own tag settings is undone here.
 // Thunderbird refuses two tags with one name, so a recipe named like another tag (such as one of your own) gets
 // " (JevIt)" added to its tag's name.
-async function syncTags(settings) {
+// One pass at a time (startup, settings changes and triage all start one): two passes that both find a tag missing
+// would both create it, and the second fails. A later pass runs last, so the latest settings win.
+let tagsSynced = Promise.resolve();
+function syncTags(settings) {
+  const pass = tagsSynced.then(() => syncTagsNow(settings));
+  tagsSynced = pass.catch(() => {}); // a failed pass is reported to its caller, not to the next one
+  return pass;
+}
+async function syncTagsNow(settings) {
   const scheme = activeScheme(settings);
   const triaged = { ...TRIAGED, name: settings.triagedName.trim() || TRIAGED.name, color: settings.triagedColor, colorLight: settings.triagedColorLight };
   const existing = new Map((await messenger.messages.tags.list()).map((t) => [t.key, t]));
@@ -588,5 +886,5 @@ async function* iterate(list) {
 }
 
 if (typeof module !== "undefined") {
-  module.exports = { DEFAULTS, RECIPE_LIBRARY, cleanBody, linkHosts, updateRecipes, questionFor, questionsFor, reuse, remember, classify, judgedBefore, pruneScores, decide, certainty, dmarcPass, plan, addExample, draftRecipe, parseBackup, askJev, resolveFolder, applyRecipes, knownSender, emailState, authServId, trustedServer, addUsage, budgetLeft, money, syncTags, colorFor, activeScheme, PALETTE };
+  module.exports = { onMessage, markRetry, scoresIn, JEV_API, OPENROUTER_API, localApi, serviceOf, receiver, connectionProblem, storeKey, keySaved, DEFAULTS, RECIPE_LIBRARY, cleanBody, linkHosts, hiddenStyle, stripHidden, updateRecipes, questionFor, questionsFor, reuse, remember, classify, judgedBefore, pruneScores, decide, certainty, dmarcPass, plan, addExample, exampleOf, mergeExamples, learn, saveSettings, draftRecipe, parseBackup, askJev, replyReason, haltRequests, countUsage, resolveFolder, applyRecipes, knownSender, emailState, authServId, trustedServer, addUsage, budgetLeft, monthName, money, syncTags, colorFor, activeScheme, PALETTE };
 }

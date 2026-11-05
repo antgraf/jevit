@@ -3,6 +3,10 @@ const SPAM_KEY = "jev_spam"; // the Connection switch "Never tag … as Spam" mi
 const FIELDS = ["name", "key", "color", "colorLight", "question", "yes", "no", "action", "folder"];
 const options = (select, entries) => select.replaceChildren(...entries.map(([value, text]) => new Option(text, value)));
 let s, folders, parents, defaultAccount, sharedNames, accounts;
+// Each recipe's examples as last read from storage, by key: Save and new examples from teaching keep what the form
+// changed since (mergeExamples). Copies: ✕ takes an example out of the form's list in place.
+let seen = {};
+const examplesOf = (recipes) => Object.fromEntries(recipes.map((r) => [r.key, [...r.examples]]));
 // Recipe keys whose card / example list is expanded, kept across render().
 const openRecipes = new Set();
 const openExamples = new Set();
@@ -13,7 +17,8 @@ const keepOpen = (el, set, key) => {
 
 // Pull form values back into `s` before any re-render or save.
 function read() {
-  s.apiKey = $("#apiKey").value.trim();
+  s.endpoint = formEndpoint();
+  s.apiKey = $("#apiKey").value.trim() || s.apiKey; // the field is write-only: empty keeps the stored key (storeKey)
   s.consent = $("#consent").checked;
   s.model = $("#model").value.trim() || DEFAULTS.model;
   s.autoTriage = $("#autoTriage").checked;
@@ -38,10 +43,11 @@ function read() {
 }
 
 function render() {
-  $("#apiKey").value = s.apiKey;
+  $("#service").value = serviceOf(s.endpoint);
+  $("#port").value = serviceOf(s.endpoint) === "local" ? new URL(s.endpoint).port : LOCAL_PORT;
   $("#consent").checked = s.consent;
-  showKeyHint();
   $("#model").value = s.model;
+  showConnection();
   $("#autoTriage").checked = s.autoTriage;
   $("#skipTriaged").checked = s.skipTriaged;
   $("#excludedAccounts").replaceChildren(...Object.entries(accounts).map(([id, name]) => {
@@ -167,25 +173,71 @@ function render() {
   ]);
 }
 
-// The key can only be entered after consent. Both save immediately, without Save:
-// unticking stops requests right away, and a typed key can't be lost to a failed Save.
+function formEndpoint() {
+  const port = Number($("#port").value);
+  const local = localApi(Number.isInteger(port) && port > 0 && port < 65536 ? port : LOCAL_PORT);
+  return { typesafe: JEV_API, openrouter: OPENROUTER_API, local }[$("#service").value];
+}
+
+const POLICIES = {
+  typesafe: "TypeSafe's terms and privacy policy apply.",
+  openrouter: "OpenRouter's policies apply, and those of the model's provider.",
+  local: "It stays on this computer, unless your Open-Jev server sends it on.",
+};
+const MODEL_HINTS = {
+  typesafe: "jev-latest, or pin a version (e.g. jev-1.13.0) once thresholds are tuned",
+  openrouter: "jev-latest or typesafe/jev-1.13. A model from another provider (openai/…) sends your mail there too.",
+  local: "The model name your Open-Jev server expects",
+};
+
+// Who receives mail and with which key, for the service and model in the form.
+function showConnection() {
+  const endpoint = formEndpoint(), service = serviceOf(endpoint), { name, keys } = SERVICES[service];
+  $("#portRow").hidden = service !== "local";
+  $("#receiver").textContent = $("#receiverShort").textContent = receiver(endpoint, $("#model").value.trim() || DEFAULTS.model);
+  $("#receiverPolicy").textContent = POLICIES[service];
+  $("#keyLabel").textContent = keys ? `${name} API key` : "Open-Jev key (only if your server needs one)";
+  $("#keyRow").title = `${keys ? `Your own key from ${keys}.` : "Only if your Open-Jev server asks for one."} Each service keeps its own key. Saved when you leave the field, never shown again and never included in backups.`;
+  $("#modelHint").textContent = MODEL_HINTS[service];
+  showKeyHint();
+}
+
+// The key can only be entered after consent. A saved key is never shown, only that there is one (s.apiKey, kept by saveConnection).
 function showKeyHint() {
-  const consent = $("#consent").checked;
+  const consent = $("#consent").checked, stored = s?.apiKey; // s is unset until the page has loaded
   $("#apiKey").disabled = !consent;
+  $("#apiKey").placeholder = stored ? "Paste a new key to replace it" : "";
+  $("#removeKey").hidden = !stored;
+  $("#keyHint").classList.toggle("saved", consent && !!stored);
   $("#keyHint").textContent = !consent
     ? "Tick the box above first to enter your API key."
-    : $("#apiKey").value.trim() ? "" : "No API key yet: JevIt can't triage until you add one.";
+    : stored ? keySaved(stored)
+    : $("#apiKey").value.trim() || serviceOf(formEndpoint()) === "local" ? "" : "No API key yet: JevIt can't triage until you add one.";
 }
+
+// The connection saves as it changes, without Save: unticking stops requests right away, a typed key can't be lost
+// to a failed Save, and consent stays with the receiver it was given for: a new service, or a model from another
+// provider, unticks it. Each service keeps its own key in `apiKeys`. A typed key goes to the service it was typed for,
+// then the field empties: an empty field keeps the stored key, and only Remove key (`remove`) clears it.
+const saveConnection = (remove = false) => serial(async () => {
+  const stored = await messenger.storage.local.get({ endpoint: DEFAULTS.endpoint, model: DEFAULTS.model, apiKey: "", apiKeys: {} });
+  const endpoint = formEndpoint(), model = $("#model").value.trim() || DEFAULTS.model, typed = $("#apiKey").value.trim();
+  const { apiKey, apiKeys } = storeKey(stored, serviceOf(stored.endpoint), serviceOf(endpoint), typed, remove);
+  const moved = receiver(endpoint, model) !== receiver(stored.endpoint, stored.model);
+  if (moved) $("#consent").checked = false;
+  Object.assign(s, { endpoint, model, apiKey, consent: $("#consent").checked });
+  await messenger.storage.local.set({ endpoint, model, apiKey, apiKeys, consent: s.consent });
+  $("#apiKey").value = "";
+  if (serviceOf(endpoint) === "local") $("#port").value = new URL(endpoint).port;
+  showConnection();
+  $("#status").textContent = moved ? `Mail would now go to ${receiver(endpoint, model)}: tick the box to allow it.`
+    : remove ? "Key removed." : typed ? "Key saved." : "Connection saved.";
+  if (s.consent && !apiKey && serviceOf(endpoint) !== "local") $("#apiKey").focus();
+});
+for (const id of ["#service", "#port", "#model", "#apiKey", "#consent"]) $(id).onchange = () => saveConnection();
+$("#removeKey").onclick = () => saveConnection(true);
 $("#apiKey").oninput = showKeyHint;
-$("#apiKey").onchange = async (e) => {
-  await messenger.storage.local.set({ apiKey: e.target.value.trim() });
-  $("#status").textContent = "API key saved.";
-};
-$("#consent").onchange = async (e) => {
-  showKeyHint();
-  await messenger.storage.local.set({ consent: e.target.checked });
-  if (e.target.checked && !$("#apiKey").value.trim()) $("#apiKey").focus();
-};
+$("#model").oninput = showConnection;
 
 // Each account's mail server whose DMARC verdict JevIt trusts; detected when a known sender is first checked.
 async function showAuthServers() {
@@ -203,7 +255,7 @@ async function showUsage() {
   const current = usage?.month === month ? usage : emptyUsage();
   const budget = Number($("#budget").value);
   const line = (u) => `${u.requests.toLocaleString()} request(s) · ${u.inputTokens.toLocaleString()} tokens · ${money(u.cost)}`;
-  $("#usageMonthName").textContent = new Date().toLocaleString(undefined, { month: "long", year: "numeric" });
+  $("#usageMonthName").textContent = monthName(month);
   $("#usageMonth").textContent = line(current) + (budget > 0 ? ` of ${money(budget)}` : " (no budget limit)");
   $("#usageTotal").textContent = line(usage?.total ?? emptyUsage());
   $("#budgetMeter").hidden = !(budget > 0);
@@ -337,8 +389,19 @@ async function save() {
       `Fix “${bad?.name ?? "duplicate tag key"}”: key a-z0-9_ and unique, question set, threshold 0–1, folder chosen for moves.`;
     return;
   }
-  await messenger.storage.local.set(s);
-  await syncTags(s);
+  // Examples taught while the form was open are kept, and come back into the form through storage.onChanged below.
+  try {
+    await saveSettings(s, seen);
+  } catch (e) {
+    $("#status").textContent = `Not saved: ${e.message}`;
+    return;
+  }
+  try {
+    await syncTags(s);
+  } catch (e) {
+    $("#status").textContent = `Saved, but updating the tags in Thunderbird failed: ${e.message}. Click Save to try again.`;
+    return;
+  }
   $("#status").textContent = "Saved.";
 }
 document.querySelectorAll(".save").forEach((b) => (b.onclick = save));
@@ -369,6 +432,7 @@ async function loadFolders() {
 (async () => {
   await loadFolders();
   s = await loadSettings();
+  seen = examplesOf(s.recipes);
   render();
   showErrors();
   await takeDraft();
@@ -377,13 +441,13 @@ async function loadFolders() {
     if (changes.usage) showUsage();
     if (changes.errors) showErrors();
     if (changes.authServers) showAuthServers();
-    // Examples taught from the popup or context menu while this page is open; keep them so Save doesn't drop them.
+    // Examples taught from the popup or context menu while this page is open: added to the form, so it shows them.
+    // Examples removed in the form and not saved yet stay removed.
     if (changes.recipes?.newValue) {
       read();
-      for (const r of s.recipes) {
-        const stored = changes.recipes.newValue.find((x) => x.key === r.key);
-        if (stored) r.examples = stored.examples;
-      }
+      const stored = examplesOf(changes.recipes.newValue);
+      for (const r of s.recipes) r.examples = mergeExamples(r.examples, stored[r.key], seen[r.key]);
+      seen = stored;
       render();
     }
   });
